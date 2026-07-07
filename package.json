@@ -1,17 +1,26 @@
 {
-  "name": "living-trust-saas",
-  "private": true,
+  "name": "@living-trust/api",
   "version": "0.1.0",
-  "workspaces": [
-    "apps/*"
-  ],
+  "type": "module",
+  "main": "src/server.js",
   "scripts": {
-    "dev": "concurrently \"npm run dev -w apps/api\" \"npm run dev -w apps/web\"",
-    "build": "npm run build -w apps/web",
-    "start": "npm run start -w apps/api",
-    "check": "npm run check -w apps/api && npm run check -w apps/web"
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "smoke": "node scripts/smoke-test.js",
+    "check": "node --check src/server.js"
   },
-  "devDependencies": {
-    "concurrently": "^9.1.2"
+  "dependencies": {
+    "@sendgrid/mail": "^8.1.4",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "helmet": "^8.0.0",
+    "node-cron": "^3.0.3",
+    "openai": "^4.104.0",
+    "pdfkit": "^0.15.2",
+    "pg": "^8.13.1",
+    "stripe": "^17.5.0",
+    "uuid": "^11.0.5",
+    "zod": "^3.24.1"
   }
 }

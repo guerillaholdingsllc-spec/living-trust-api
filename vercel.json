@@ -1,0 +1,43 @@
+{
+  "installCommand": "npm install",
+  "buildCommand": "npm run build -w apps/web",
+  "outputDirectory": "apps/web/dist",
+  "rewrites": [
+    {
+      "source": "/livingtrust/api/:path*",
+      "destination": "/api/:path*"
+    },
+    {
+      "source": "/livingtrust/assets/:path*",
+      "destination": "/assets/:path*"
+    },
+    {
+      "source": "/livingtrust/images/:path*",
+      "destination": "/images/:path*"
+    },
+    {
+      "source": "/GAFC/gafc/:path*",
+      "destination": "/gafc/:path*"
+    },
+    {
+      "source": "/GAFC/assets/:path*",
+      "destination": "/assets/:path*"
+    },
+    {
+      "source": "/GAFC",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/GAFC/:path*",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/livingtrust",
+      "destination": "/index.html"
+    },
+    {
+      "source": "/livingtrust/:path*",
+      "destination": "/index.html"
+    }
+  ]
+}

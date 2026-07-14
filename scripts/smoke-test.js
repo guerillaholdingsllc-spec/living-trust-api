@@ -37,7 +37,7 @@ try {
   await assertOk("readiness endpoint responds", [200, 503].includes(readiness.response.status));
 
   const stateRules = await request("/state-rules/CA");
-  await assertOk("state rules endpoint", stateRules.response.ok && stateRules.data.state === "CA");
+  await assertOk("state rules endpoint", stateRules.response.ok && stateRules.data.code === "CA");
 
   const draft = await request("/intake-drafts", {
     method: "POST",

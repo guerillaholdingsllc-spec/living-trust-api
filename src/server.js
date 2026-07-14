@@ -373,32 +373,40 @@ async function deliverPackage(trustId) {
   await pool.query("update trusts set status = 'delivered', delivered_at = now(), updated_at = now() where id = $1", [trustId]);
 }
 
-cron.schedule("0 9 * * *", async () => {
-  const { rows } = await pool.query(
-    "select id, grantor_email, grantor_name from trusts where next_review_at <= now() and status = 'delivered'"
-  );
-  for (const trust of rows) await sendReviewReminder(trust);
-});
+let jobsStarted = false;
 
-cron.schedule("30 16 * * *", async () => {
-  const { rows } = await pool.query(
-    `select id, email, full_name from intake_drafts
-     where email is not null
-       and follow_up_status = 'new'
-       and created_at <= now() - interval '1 day'
-     order by created_at asc
-     limit 25`
-  );
-  for (const draft of rows) {
-    await sendAbandonedIntakeFollowUp(draft);
-    await pool.query("update intake_drafts set follow_up_status = 'sent', updated_at = now() where id = $1", [draft.id]);
-  }
-});
+function startScheduledJobs() {
+  if (jobsStarted) return;
+  jobsStarted = true;
+
+  cron.schedule("0 9 * * *", async () => {
+    const { rows } = await pool.query(
+      "select id, grantor_email, grantor_name from trusts where next_review_at <= now() and status = 'delivered'"
+    );
+    for (const trust of rows) await sendReviewReminder(trust);
+  });
+
+  cron.schedule("30 16 * * *", async () => {
+    const { rows } = await pool.query(
+      `select id, email, full_name from intake_drafts
+       where email is not null
+         and follow_up_status = 'new'
+         and created_at <= now() - interval '1 day'
+       order by created_at asc
+       limit 25`
+    );
+    for (const draft of rows) {
+      await sendAbandonedIntakeFollowUp(draft);
+      await pool.query("update intake_drafts set follow_up_status = 'sent', updated_at = now() where id = $1", [draft.id]);
+    }
+  });
+}
 
 export { app, pool };
 
 export async function startServer() {
   await initDb(pool);
+  startScheduledJobs();
   return app.listen(port, () => console.log(`Living Trust API listening on ${port}`));
 }
 

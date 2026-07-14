@@ -46,11 +46,25 @@ export async function initDb(pool) {
       updated_at timestamptz not null default now()
     );
   `);
+
+  await pool.query(`
+    create table if not exists users (
+      id uuid primary key,
+      email text not null unique,
+      full_name text not null default '',
+      password_hash text not null,
+      reset_token text,
+      reset_expires_at timestamptz,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now()
+    );
+  `);
 }
 
 function createMemoryPool() {
   const trusts = [];
   const intakeDrafts = [];
+  const users = [];
 
   return {
     async query(sql, params = []) {
@@ -101,6 +115,60 @@ function createMemoryPool() {
         return { rows: [] };
       }
 
+      if (normalized.startsWith("insert into users")) {
+        const [id, email, full_name, password_hash] = params;
+        if (users.some((user) => user.email.toLowerCase() === String(email).toLowerCase())) {
+          const error = new Error("duplicate key value violates unique constraint");
+          error.code = "23505";
+          throw error;
+        }
+        users.push({
+          id,
+          email,
+          full_name,
+          password_hash,
+          reset_token: null,
+          reset_expires_at: null,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        });
+        return { rows: [] };
+      }
+
+      if (normalized.includes("from users where lower(email) = lower($1)")) {
+        return { rows: users.filter((user) => user.email.toLowerCase() === String(params[0]).toLowerCase()) };
+      }
+
+      if (normalized.includes("from users where id = $1")) {
+        return { rows: users.filter((user) => user.id === params[0]) };
+      }
+
+      if (normalized.startsWith("update users set reset_token")) {
+        const user = users.find((item) => item.email.toLowerCase() === String(params[2]).toLowerCase());
+        if (user) {
+          user.reset_token = params[0];
+          user.reset_expires_at = params[1];
+          user.updated_at = new Date().toISOString();
+        }
+        return { rows: [] };
+      }
+
+      if (normalized.includes("from users where reset_token = $1")) {
+        const now = Date.now();
+        return { rows: users.filter((user) => user.reset_token === params[0] && user.reset_expires_at && new Date(user.reset_expires_at).getTime() > now) };
+      }
+
+      if (normalized.startsWith("update users set password_hash")) {
+        const user = users.find((item) => item.id === params[1]);
+        if (user) {
+          user.password_hash = params[0];
+          user.reset_token = null;
+          user.reset_expires_at = null;
+          user.updated_at = new Date().toISOString();
+        }
+        return { rows: [] };
+      }
+
       if (normalized.includes("select status, count(*)::int as count from trusts")) {
         const counts = trusts.reduce((acc, trust) => {
           acc[trust.status] = (acc[trust.status] || 0) + 1;
@@ -133,6 +201,23 @@ function createMemoryPool() {
 
       if (normalized.includes("from trusts where id = $1")) {
         return { rows: trusts.filter((trust) => trust.id === params[0]) };
+      }
+
+      if (normalized.includes("from trusts where lower(grantor_email) = lower($1)")) {
+        return {
+          rows: trusts
+            .filter((trust) => trust.grantor_email.toLowerCase() === String(params[0]).toLowerCase())
+            .map(({ id, grantor_name, grantor_email, state, status, attorney_review_status, created_at, updated_at }) => ({
+              id,
+              grantor_name,
+              grantor_email,
+              state,
+              status,
+              attorney_review_status,
+              created_at,
+              updated_at
+            }))
+        };
       }
 
       if (normalized.startsWith("update trusts set attorney_review_status")) {

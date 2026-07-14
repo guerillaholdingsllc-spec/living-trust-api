@@ -37,3 +37,16 @@ create table if not exists intake_drafts (
 
 create index if not exists intake_drafts_follow_up_idx on intake_drafts (follow_up_status, created_at);
 create index if not exists intake_drafts_email_idx on intake_drafts (email);
+
+create table if not exists users (
+  id uuid primary key,
+  email text not null unique,
+  full_name text not null default '',
+  password_hash text not null,
+  reset_token text,
+  reset_expires_at timestamptz,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+create index if not exists users_email_idx on users (lower(email));

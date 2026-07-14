@@ -3,15 +3,15 @@ import express from "express";
 import cors from "cors";
 import helmet from "helmet";
 import Stripe from "stripe";
-import sgMail from "@sendgrid/mail";
 import cron from "node-cron";
+import crypto from "crypto";
 import { z } from "zod";
 import { v4 as uuid } from "uuid";
 import { pathToFileURL } from "url";
 import { createPool, initDb } from "./services/db.js";
 import { generateAttorneyReviewPacket, generateIntakeGuidance, generateLeadBrief, generateTrustPackage } from "./services/llm.js";
 import { buildPdfPackage } from "./services/pdf.js";
-import { sendAbandonedIntakeFollowUp, sendDocumentPackage, sendReviewReminder } from "./services/email.js";
+import { sendDocumentPackage, sendPasswordResetEmail, sendWelcomeEmail } from "./services/email.js";
 import { submitAttorneyReview } from "./services/attorney.js";
 import { STATE_RULES } from "./stateRules.js";
 
@@ -19,8 +19,7 @@ const app = express();
 const port = process.env.PORT || 8080;
 const pool = createPool();
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
-
-if (process.env.SENDGRID_API_KEY) sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+const jwtSecret = process.env.JWT_SECRET || "livingtrust-dev-secret-change-before-production";
 
 const TrustSubmission = z.object({
   grantor: z.object({
@@ -70,11 +69,78 @@ const IntakeDraft = z.object({
   source: z.string().optional().default("web_app")
 });
 
+const RegisterInput = z.object({
+  email: z.string().email(),
+  password: z.string().min(8),
+  fullName: z.string().min(2).optional().default("")
+});
+
+const LoginInput = z.object({
+  email: z.string().email(),
+  password: z.string().min(1)
+});
+
+const ForgotPasswordInput = z.object({
+  email: z.string().email()
+});
+
+const ResetPasswordInput = z.object({
+  token: z.string().min(16),
+  password: z.string().min(8)
+});
+
 const LeadBriefRequest = z.object({
   market: z.string().optional().default("United States"),
   audience: z.string().optional().default("homeowners, parents, business owners, and families planning for probate avoidance"),
   offer: z.string().optional().default("Attorney-reviewed living trust package with guided intake, PDFs, funding instructions, and annual review reminders")
 });
+
+function base64url(value) {
+  return Buffer.from(value).toString("base64url");
+}
+
+function signToken(payload, expiresInSeconds = 60 * 60 * 24 * 7) {
+  const header = { alg: "HS256", typ: "JWT" };
+  const body = { ...payload, exp: Math.floor(Date.now() / 1000) + expiresInSeconds };
+  const unsigned = `${base64url(JSON.stringify(header))}.${base64url(JSON.stringify(body))}`;
+  const signature = crypto.createHmac("sha256", jwtSecret).update(unsigned).digest("base64url");
+  return `${unsigned}.${signature}`;
+}
+
+function verifyToken(token) {
+  const [header, body, signature] = String(token || "").split(".");
+  if (!header || !body || !signature) throw new Error("Invalid token");
+  const expected = crypto.createHmac("sha256", jwtSecret).update(`${header}.${body}`).digest("base64url");
+  if (!crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) throw new Error("Invalid token");
+  const payload = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+  if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) throw new Error("Token expired");
+  return payload;
+}
+
+function hashPassword(password, salt = crypto.randomBytes(16).toString("hex")) {
+  const hash = crypto.scryptSync(password, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+
+function verifyPassword(password, stored) {
+  const [salt, original] = String(stored || "").split(":");
+  if (!salt || !original) return false;
+  const candidate = crypto.scryptSync(password, salt, 64);
+  return crypto.timingSafeEqual(Buffer.from(original, "hex"), candidate);
+}
+
+async function requireAuth(req, res, next) {
+  try {
+    const token = String(req.headers.authorization || "").replace(/^Bearer\s+/i, "");
+    const payload = verifyToken(token);
+    const { rows } = await pool.query("select id, email, full_name from users where id = $1", [payload.sub]);
+    if (!rows[0]) return res.status(401).json({ error: "Unauthorized" });
+    req.user = rows[0];
+    next();
+  } catch (_error) {
+    res.status(401).json({ error: "Unauthorized" });
+  }
+}
 
 app.use(helmet());
 app.use(cors({ origin: process.env.WEB_ORIGIN?.split(",") || "*" }));
@@ -101,6 +167,98 @@ app.post("/webhooks/stripe", express.raw({ type: "application/json" }), async (r
 
 app.use(express.json({ limit: "2mb" }));
 
+app.post("/auth/register", async (req, res) => {
+  try {
+    const input = RegisterInput.parse(req.body);
+    const id = uuid();
+    const email = input.email.toLowerCase();
+    await pool.query(
+      "insert into users (id, email, full_name, password_hash) values ($1, $2, $3, $4)",
+      [id, email, input.fullName, hashPassword(input.password)]
+    );
+    await sendWelcomeEmail({ to: email, name: input.fullName });
+    res.status(201).json({
+      token: signToken({ sub: id, email }),
+      user: { id, email, fullName: input.fullName }
+    });
+  } catch (error) {
+    console.error(error);
+    const status = error instanceof z.ZodError ? 422 : error.code === "23505" ? 409 : 500;
+    res.status(status).json({ error: status === 409 ? "Account already exists." : error.message });
+  }
+});
+
+app.post("/auth/login", async (req, res) => {
+  try {
+    const input = LoginInput.parse(req.body);
+    const { rows } = await pool.query("select * from users where lower(email) = lower($1)", [input.email]);
+    const user = rows[0];
+    if (!user || !verifyPassword(input.password, user.password_hash)) {
+      return res.status(401).json({ error: "Invalid email or password." });
+    }
+    res.json({
+      token: signToken({ sub: user.id, email: user.email }),
+      user: { id: user.id, email: user.email, fullName: user.full_name || "" }
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(error instanceof z.ZodError ? 422 : 500).json({ error: error.message });
+  }
+});
+
+app.get("/auth/me", requireAuth, (req, res) => {
+  res.json({ user: { id: req.user.id, email: req.user.email, fullName: req.user.full_name || "" } });
+});
+
+app.post("/auth/forgot-password", async (req, res) => {
+  try {
+    const input = ForgotPasswordInput.parse(req.body);
+    const { rows } = await pool.query("select * from users where lower(email) = lower($1)", [input.email]);
+    const user = rows[0];
+    if (user) {
+      const token = crypto.randomBytes(24).toString("hex");
+      const expires = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+      await pool.query("update users set reset_token = $1, reset_expires_at = $2, updated_at = now() where lower(email) = lower($3)", [token, expires, input.email]);
+      const baseUrl = process.env.WEB_ORIGIN || "https://thelegacytrust.app";
+      await sendPasswordResetEmail({ to: user.email, name: user.full_name, resetUrl: `${baseUrl}/LTG/?reset=${token}` });
+    }
+    res.json({ ok: true, message: "If that email exists, a password reset was sent." });
+  } catch (error) {
+    console.error(error);
+    res.status(error instanceof z.ZodError ? 422 : 500).json({ error: error.message });
+  }
+});
+
+app.post("/auth/reset-password", async (req, res) => {
+  try {
+    const input = ResetPasswordInput.parse(req.body);
+    const { rows } = await pool.query("select * from users where reset_token = $1 and reset_expires_at > now()", [input.token]);
+    const user = rows[0];
+    if (!user) return res.status(400).json({ error: "Reset link is invalid or expired." });
+    await pool.query("update users set password_hash = $1, reset_token = null, reset_expires_at = null, updated_at = now() where id = $2", [hashPassword(input.password), user.id]);
+    res.json({ ok: true, message: "Password updated. You can sign in now." });
+  } catch (error) {
+    console.error(error);
+    res.status(error instanceof z.ZodError ? 422 : 500).json({ error: error.message });
+  }
+});
+
+app.get("/auth/my-trusts", requireAuth, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `select id, grantor_name, grantor_email, state, status, attorney_review_status, created_at, updated_at
+       from trusts
+       where lower(grantor_email) = lower($1)
+       order by created_at desc`,
+      [req.user.email]
+    );
+    res.json({ trusts: rows });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 app.get("/health", (_req, res) => {
   res.json({ ok: true, stateRules: Object.keys(STATE_RULES).length });
 });
@@ -112,7 +270,7 @@ app.get("/readiness", async (_req, res) => {
     openai: Boolean(process.env.OPENAI_API_KEY),
     stripe: Boolean(process.env.STRIPE_SECRET_KEY),
     stripeWebhook: Boolean(process.env.STRIPE_WEBHOOK_SECRET),
-    sendgrid: Boolean(process.env.SENDGRID_API_KEY && process.env.SENDGRID_FROM),
+    email: Boolean((process.env.BREVO_API_KEY && process.env.BREVO_FROM) || (process.env.SENDGRID_API_KEY && process.env.SENDGRID_FROM)),
     attorneyReview: Boolean(process.env.ATTORNEY_REVIEW_WEBHOOK_URL),
     webOrigin: Boolean(process.env.WEB_ORIGIN)
   };
@@ -124,7 +282,7 @@ app.get("/readiness", async (_req, res) => {
     checks.database = false;
   }
 
-  const requiredForLaunch = ["database", "stateRules", "openai", "stripe", "stripeWebhook", "sendgrid", "webOrigin"];
+  const requiredForLaunch = ["database", "stateRules", "openai", "stripe", "stripeWebhook", "email", "webOrigin"];
   const missing = requiredForLaunch.filter((name) => !checks[name]);
 
   res.status(missing.length ? 503 : 200).json({
@@ -380,25 +538,11 @@ function startScheduledJobs() {
   jobsStarted = true;
 
   cron.schedule("0 9 * * *", async () => {
-    const { rows } = await pool.query(
-      "select id, grantor_email, grantor_name from trusts where next_review_at <= now() and status = 'delivered'"
-    );
-    for (const trust of rows) await sendReviewReminder(trust);
+    console.log("Annual trust review email job is disabled by policy.");
   });
 
   cron.schedule("30 16 * * *", async () => {
-    const { rows } = await pool.query(
-      `select id, email, full_name from intake_drafts
-       where email is not null
-         and follow_up_status = 'new'
-         and created_at <= now() - interval '1 day'
-       order by created_at asc
-       limit 25`
-    );
-    for (const draft of rows) {
-      await sendAbandonedIntakeFollowUp(draft);
-      await pool.query("update intake_drafts set follow_up_status = 'sent', updated_at = now() where id = $1", [draft.id]);
-    }
+    console.log("Abandoned intake follow-up email job is disabled by policy.");
   });
 }
 
